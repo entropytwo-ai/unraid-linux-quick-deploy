@@ -1,0 +1,15 @@
+# Downloaded / generated images
+*.qcow2
+*.img
+*.iso
+*.part
+cloud-images/
+
+# Logs and dry-run output
+unraid-quick-deploy-*.log
+unraid-quick-deploy-dryrun-*/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~

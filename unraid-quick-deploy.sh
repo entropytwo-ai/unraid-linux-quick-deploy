@@ -40,7 +40,8 @@ LOG_DIR="${LOG_DIR:-/tmp}"
 ASSUME_YES="${ASSUME_YES:-0}"     # 1 = accept every default, never prompt
 DRY_RUN="${DRY_RUN:-0}"           # 1 = show what would happen, change nothing
 DEPLOY_TYPE="${DEPLOY_TYPE:-}"    # vm | docker | both   (or 1 | 2 | 3)
-OS_CHOICE="${OS_CHOICE:-}"        # 1-12 or c (custom)
+OS_CHOICE="${OS_CHOICE:-}"        # 1-16, c (custom) or an id such as debian-stable (see --list)
+LIST_ONLY=0
 
 # Storage paths (empty = auto-detect from Unraid config)
 DOMAINS_PATH="${DOMAINS_PATH:-}"
@@ -69,6 +70,9 @@ DEFAULT_USER="${DEFAULT_USER:-admin}"
 DEFAULT_PASS="${DEFAULT_PASS:-password123}"
 CLOUD_IMAGE_URL="${CLOUD_IMAGE_URL:-}"   # override the distro's cloud image URL
 ISO_URL="${ISO_URL:-}"                   # override the distro's installer ISO URL
+CLOUD_IMAGE_SUM_URL="${CLOUD_IMAGE_SUM_URL:-}"  # checksum file for a CLOUD_IMAGE_URL override
+ISO_SUM_URL="${ISO_SUM_URL:-}"           # checksum file for an ISO_URL override
+VERIFY_CHECKSUMS="${VERIFY_CHECKSUMS:-yes}"     # no = skip checksum verification (not recommended)
 
 # Docker settings
 CONTAINER_NAME="${CONTAINER_NAME:-}"
@@ -102,6 +106,8 @@ Usage: $(basename "$0") [options]
 Options:
   -y, --yes       Accept every detected/default value without prompting
   -n, --dry-run   Detect, prompt and generate configs, but change nothing
+  -l, --list      Look up and print the image/ISO every menu entry points to
+                  right now (no root needed, changes nothing), then exit
   -h, --help      Show this help
   -V, --version   Show version
 
@@ -113,6 +119,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -y|--yes) ASSUME_YES=1 ;;
         -n|--dry-run) DRY_RUN=1 ;;
+        -l|--list) LIST_ONLY=1 ;;
         -h|--help) usage; exit 0 ;;
         -V|--version) echo "$QD_VERSION"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -526,17 +533,45 @@ check_tool() {
 }
 
 DOWNLOADER=""
+CLOUD_URL=""; CLOUD_FILE=""; CLOUD_SUM_URL=""; CLOUD_LABEL=""; ISO_FILE=""; ISO_LABEL=""
 validate_common() {
     local t missing=0
     [[ $EUID -eq 0 ]] || die "Run this script as root (Unraid's terminal logs in as root)."
     (( BASH_VERSINFO[0] >= 4 )) || die "Bash 4+ is required (found $BASH_VERSION)."
-    for t in awk sed grep sort tee mktemp seq; do
+    for t in awk sed grep sort tee mktemp seq cut tr wc tac basename du; do
         command -v "$t" &>/dev/null || { err "Required tool '$t' is missing."; missing=1; }
     done
     [[ $missing -eq 0 ]] || die "Basic shell tools are missing."
+    detect_downloader
+    validate_lookup_tools
+}
+
+# detect_downloader - curl (preferred) or wget, each actually executed
+detect_downloader() {
     if check_tool "Downloader (curl)" curl --version; then DOWNLOADER=curl
     elif check_tool "Downloader (wget)" wget --version; then DOWNLOADER=wget
     else die "Neither curl nor wget works - cannot download images."; fi
+}
+
+# validate_lookup_tools - the release lookup and checksum code needs these to
+# actually work, not just exist: the hash tools must produce the known digest
+# of an empty input, 'sort -V' must order versions, and 'date -d' must parse
+# an HTTP date (GNU coreutils behaviour; BusyBox differs).
+validate_lookup_tools() {
+    local bad=0
+    if [[ "$(printf '' | sha256sum 2>/dev/null | cut -d' ' -f1)" == e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]]; then
+        ok "sha256sum works"
+    else err "sha256sum is missing or broken - downloads cannot be verified."; bad=1; fi
+    if [[ "$(printf '' | sha512sum 2>/dev/null | cut -c1-16)" == cf83e1357eefb8bd ]]; then
+        ok "sha512sum works"
+    else err "sha512sum is missing or broken - Debian/Alpine downloads cannot be verified."; bad=1; fi
+    if [[ "$(printf '1.10\n1.9\n1.2\n' | sort -V 2>/dev/null | tail -n1)" == 1.10 ]]; then
+        ok "sort -V (version sort) works"
+    else err "'sort -V' is not supported - the newest release cannot be picked."; bad=1; fi
+    if [[ "$(date -u -d 'Mon, 05 Oct 2026 10:00:00 GMT' +%Y%m%d 2>/dev/null)" == 20261005 ]]; then
+        ok "date -d (HTTP date parsing) works"
+    else warn "'date -d' cannot parse HTTP dates - NixOS/CentOS ISOs will be named by today's date instead."; fi
+    [[ $bad -eq 0 ]] || die "Tools needed to look up and verify images are missing (see above)."
 }
 
 VM_OK=1; DOCKER_OK=1
@@ -626,52 +661,155 @@ detect_libvirt_caps() {
 # =============================================================================
 # 4. Distro catalogue
 # =============================================================================
+# Nothing below pins a point release or build: every resolver reads the
+# distro's own release metadata / directory listing, picks the newest dated or
+# versioned file (never a moving "latest" alias, so a new release is downloaded
+# fresh instead of reusing an old cached copy) and records the checksum file
+# that the download is verified against.
+fetch_text() {
+    if [[ "$DOWNLOADER" == wget ]]; then wget -qO- --timeout=30 --tries=2 "$1" 2>/dev/null || true
+    else curl -fsSL --connect-timeout 10 --max-time 60 --retry 2 "$1" 2>/dev/null || true; fi
+}
+# url_ok URL - the URL exists (fetches 1 byte; some mirrors reject HEAD)
+url_ok() {
+    if [[ "$DOWNLOADER" == wget ]]; then wget -q --spider --timeout=30 --tries=1 "$1" 2>/dev/null
+    else curl -fsL --connect-timeout 10 --max-time 30 --retry 1 -r 0-0 -o /dev/null "$1" 2>/dev/null; fi
+}
+# effective_url URL - final URL after redirects (empty on failure)
+effective_url() {
+    if [[ "$DOWNLOADER" == wget ]]; then
+        wget -S --spider --timeout=30 --tries=1 "$1" 2>&1 | awk 'tolower($1) == "location:" {u = $2} END {print u}' || true
+    else
+        curl -fsIL --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' "$1" 2>/dev/null || true
+    fi
+}
+# last_modified URL - Last-Modified header of URL as YYYYMMDD (empty if unknown)
+last_modified() {
+    local h
+    if [[ "$DOWNLOADER" == wget ]]; then h="$(wget -S --spider --timeout=30 --tries=1 "$1" 2>&1 || true)"
+    else h="$(curl -fsIL --connect-timeout 10 --max-time 30 "$1" 2>/dev/null || true)"; fi
+    h="$(printf '%s\n' "$h" | awk 'tolower($1) == "last-modified:" {sub(/^[^:]*: */, ""); v = $0} END {print v}' | tr -d '\r')"
+    [[ -n "$h" ]] && date -u -d "$h" +%Y%m%d 2>/dev/null || true
+}
 # latest_match URL REGEX - newest (version-sorted) match of REGEX in an index page
 latest_match() {
     fetch_text "$1" | grep -oE "$2" | sort -uV | tail -n1 || true
 }
-fetch_text() {
-    if [[ "$DOWNLOADER" == wget ]]; then wget -qO- --timeout=30 "$1" 2>/dev/null || true
-    else curl -fsSL --max-time 30 "$1" 2>/dev/null || true; fi
+# hrefs URL REGEX - directory names/links matching REGEX in an index page
+hrefs() {
+    fetch_text "$1" | grep -oE "href=\"$2\"" | sed -E 's/^href="//; s/"$//; s#/$##' || true
 }
 
-# distro_load N - sets D_* for menu entry N
+# Menu entries. Numbers are fixed - new entries are appended at the end so an
+# existing OS_CHOICE number never changes meaning. Each also has a stable id
+# that OS_CHOICE accepts (e.g. OS_CHOICE=debian-stable).
+DISTRO_COUNT=16
+
+# distro_load N|ID - sets D_* for a menu entry (number, id or legacy key)
 distro_load() {
-    D_KEY=""; D_NAME=""; D_ICONS="linux.png"; D_DOCKER=""; D_CLOUD=1; D_ISO=1
+    local sel="${1,,}" i
+    if [[ ! "$sel" =~ ^([0-9]+|c)$ ]]; then
+        for i in $(seq 1 "$DISTRO_COUNT") c; do
+            distro_load "$i"
+            if [[ "$sel" == "$D_ID" || "$sel" == "$D_KEY" ]]; then return 0; fi
+        done
+        return 1
+    fi
+    D_KEY=""; D_ID=""; D_NAME=""; D_ICONS="linux.png"; D_DOCKER=""; D_CLOUD=1; D_ISO=1
     D_OS_TYPE="standard"; D_MIN_MEM=0; D_MIN_DISK=""; D_CLOUD_BIOS_ONLY=0; D_SHELL="/bin/bash"
-    case "$1" in
-        1)  D_KEY=ubuntu2404;  D_NAME="Ubuntu 24.04 LTS (Noble)";      D_ICONS="ubuntu.png"; D_DOCKER="ubuntu:24.04" ;;
-        2)  D_KEY=ubuntu2604;  D_NAME="Ubuntu 26.04 LTS (Resolute)";   D_ICONS="ubuntu.png"; D_DOCKER="ubuntu:26.04" ;;
-        3)  D_KEY=debian12;    D_NAME="Debian 12 (Bookworm)";          D_ICONS="debian.png"; D_DOCKER="debian:12" ;;
-        4)  D_KEY=debian13;    D_NAME="Debian 13 (Trixie)";            D_ICONS="debian.png"; D_DOCKER="debian:13" ;;
-        5)  D_KEY=fedora;      D_NAME="Fedora (latest release)";       D_ICONS="fedora.png"; D_DOCKER="fedora:latest" ;;
-        6)  D_KEY=arch;        D_NAME="Arch Linux";                    D_ICONS="arch.png archlinux.png"; D_DOCKER="archlinux:latest" ;;
-        7)  D_KEY=omarchy;     D_NAME="Omarchy (Arch + Omarchy ready)"; D_ICONS="arch.png archlinux.png"
+    D_FAMILY=""; D_CODENAME=""; D_VER=""; D_DYN=""; D_RESOLVED=0
+    case "$sel" in
+        1)  D_KEY=ubuntu2404; D_ID=ubuntu-24.04; D_NAME="Ubuntu 24.04 LTS (Noble)"; D_ICONS="ubuntu.png"; D_DOCKER="ubuntu:24.04"
+            D_FAMILY=ubuntu; D_CODENAME=noble; D_VER=24.04 ;;
+        2)  D_KEY=ubuntu2604; D_ID=ubuntu-26.04; D_NAME="Ubuntu 26.04 LTS (Resolute)"; D_ICONS="ubuntu.png"; D_DOCKER="ubuntu:26.04"
+            D_FAMILY=ubuntu; D_CODENAME=resolute; D_VER=26.04 ;;
+        3)  D_KEY=debian12; D_ID=debian-12; D_NAME="Debian 12 (Bookworm)"; D_ICONS="debian.png"; D_DOCKER="debian:12"
+            D_FAMILY=debian; D_CODENAME=bookworm; D_VER=12 ;;
+        4)  D_KEY=debian13; D_ID=debian-13; D_NAME="Debian 13 (Trixie)"; D_ICONS="debian.png"; D_DOCKER="debian:13"
+            D_FAMILY=debian; D_CODENAME=trixie; D_VER=13 ;;
+        5)  D_KEY=fedora; D_ID=fedora; D_NAME="Fedora (newest release)"; D_ICONS="fedora.png"; D_DOCKER="fedora:latest" ;;
+        6)  D_KEY=arch; D_ID=arch; D_NAME="Arch Linux (rolling)"; D_ICONS="arch.png archlinux.png"; D_DOCKER="archlinux:latest" ;;
+        7)  D_KEY=omarchy; D_ID=omarchy; D_NAME="Omarchy (Arch + Omarchy ready)"; D_ICONS="arch.png archlinux.png"
             D_ISO=0; D_OS_TYPE="omarchy"; D_MIN_MEM=4096; D_MIN_DISK="32G" ;;
-        8)  D_KEY=nixos;       D_NAME="NixOS (unstable)";              D_ICONS="nixos.png linux.png"; D_DOCKER="nixos/nix:latest"; D_CLOUD=0 ;;
-        9)  D_KEY=rocky9;      D_NAME="Rocky Linux 9";                 D_ICONS="rocky.png rockylinux.png centos.png"; D_DOCKER="rockylinux/rockylinux:9" ;;
-        10) D_KEY=alpine;      D_NAME="Alpine Linux (latest stable)";  D_ICONS="alpine.png alpinelinux.png"; D_DOCKER="alpine:latest"
+        8)  D_KEY=nixos; D_ID=nixos; D_NAME="NixOS (unstable)"; D_ICONS="nixos.png linux.png"; D_DOCKER="nixos/nix:latest"; D_CLOUD=0 ;;
+        9)  D_KEY=rocky9; D_ID=rocky-9; D_NAME="Rocky Linux 9"; D_ICONS="rocky.png rockylinux.png centos.png"; D_DOCKER="rockylinux/rockylinux:9" ;;
+        10) D_KEY=alpine; D_ID=alpine; D_NAME="Alpine Linux (newest stable)"; D_ICONS="alpine.png alpinelinux.png"; D_DOCKER="alpine:latest"
             D_CLOUD_BIOS_ONLY=1; D_SHELL="/bin/sh" ;;
-        11) D_KEY=centos10;    D_NAME="CentOS Stream 10";              D_ICONS="centos.png"; D_DOCKER="quay.io/centos/centos:stream10" ;;
-        12) D_KEY=rocky10;     D_NAME="Rocky Linux 10";                D_ICONS="rocky.png rockylinux.png centos.png"; D_DOCKER="rockylinux/rockylinux:10" ;;
-        c|C) D_KEY=custom;     D_NAME="Custom ISO / custom image";     D_CLOUD=0 ;;
+        11) D_KEY=centos10; D_ID=centos-10; D_NAME="CentOS Stream 10"; D_ICONS="centos.png"; D_DOCKER="quay.io/centos/centos:stream10" ;;
+        12) D_KEY=rocky10; D_ID=rocky-10; D_NAME="Rocky Linux 10"; D_ICONS="rocky.png rockylinux.png centos.png"; D_DOCKER="rockylinux/rockylinux:10" ;;
+        # Auto-updating entries: the release itself is looked up live.
+        13) D_KEY=ubuntults; D_ID=ubuntu-lts; D_NAME="Ubuntu LTS (newest, looked up live)"; D_ICONS="ubuntu.png"
+            D_FAMILY=ubuntu; D_DYN=lts; D_DOCKER="ubuntu:latest" ;;
+        14) D_KEY=ubuntulatest; D_ID=ubuntu-latest; D_NAME="Ubuntu newest release (incl. interim)"; D_ICONS="ubuntu.png"
+            D_FAMILY=ubuntu; D_DYN=latest; D_DOCKER="ubuntu:rolling" ;;
+        15) D_KEY=debianstable; D_ID=debian-stable; D_NAME="Debian stable (newest, looked up live)"; D_ICONS="debian.png"
+            D_FAMILY=debian; D_DYN=stable; D_DOCKER="debian:stable" ;;
+        16) D_KEY=debianoldstable; D_ID=debian-oldstable; D_NAME="Debian oldstable (looked up live)"; D_ICONS="debian.png"
+            D_FAMILY=debian; D_DYN=oldstable; D_DOCKER="debian:oldstable" ;;
+        c)  D_KEY=custom; D_ID=custom; D_NAME="Custom ISO / custom image"; D_CLOUD=0 ;;
         *) return 1 ;;
     esac
+}
+
+# docker_tag_ok REPO TAG - the official Docker Hub image has this tag
+docker_tag_ok() {
+    url_ok "https://hub.docker.com/v2/repositories/library/$1/tags/$2"
+}
+
+# resolve_release - for the auto-updating entries (13-16), find the release
+# the menu entry points to right now and fill in D_CODENAME / D_VER / D_KEY /
+# D_NAME / D_DOCKER. Returns 1 if the release metadata cannot be read.
+resolve_release() {
+    [[ -z "$D_DYN" || "$D_RESOLVED" == 1 ]] && return 0
+    local list line c v lts
+    case "$D_FAMILY" in
+        ubuntu)
+            # Canonical's release-upgrader metadata: one stanza per release.
+            list="$(fetch_text "https://changelogs.ubuntu.com/meta-release" | awk '
+                /^Dist:/ {d = $2}
+                /^Version:/ { lts = ($0 ~ /LTS/); split($2, p, "."); if (d != "") print d, p[1] "." p[2], lts; d = "" }')"
+            [[ "$D_DYN" == lts ]] && list="$(awk '$3 == 1' <<<"$list")"
+            line="$(tail -n1 <<<"$list")"
+            read -r c v lts <<<"$line" || true
+            [[ -n "$c" && -n "$v" ]] || return 1
+            D_CODENAME="$c"; D_VER="$v"; D_KEY="ubuntu${v//./}"
+            D_NAME="Ubuntu ${v}$([[ "$lts" == 1 ]] && echo " LTS") (${c^})"
+            [[ "$D_DYN" == lts ]] && D_NAME+=" - newest LTS" || D_NAME+=" - newest release"
+            docker_tag_ok ubuntu "$v" && D_DOCKER="ubuntu:$v"
+            ;;
+        debian)
+            # The archive's suite alias (stable/oldstable) names the codename + version.
+            list="$(fetch_text "https://deb.debian.org/debian/dists/${D_DYN}/Release")"
+            c="$(awk '/^Codename:/ {print $2; exit}' <<<"$list")"
+            v="$(awk '/^Version:/ {split($2, p, "."); print p[1]; exit}' <<<"$list")"
+            [[ -n "$c" && "$v" =~ ^[0-9]+$ ]] || return 1
+            D_CODENAME="$c"; D_VER="$v"; D_KEY="debian${v}"
+            D_NAME="Debian ${v} (${c^}) - ${D_DYN}"
+            docker_tag_ok debian "$v" && D_DOCKER="debian:$v"
+            ;;
+        *) return 1 ;;
+    esac
+    D_RESOLVED=1
 }
 
 choose_distro() {
     step "Choose a Linux distribution"
     if [[ -z "$OS_CHOICE" ]]; then
         local i
-        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        printf '  %sImages and ISOs are looked up live, so the newest build is always used.%s\n' "$C_DIM" "$C_RESET"
+        for i in $(seq 1 "$DISTRO_COUNT"); do
             distro_load "$i"
-            printf '  %s[%2s]%s %-34s %s%s%s\n' "$C_BOLD" "$i" "$C_RESET" "$D_NAME" "$C_DIM" \
+            printf '  %s[%2s]%s %-40s %s%s%s\n' "$C_BOLD" "$i" "$C_RESET" "$D_NAME" "$C_DIM" \
                 "$( { [[ $D_CLOUD == 1 ]] && printf 'cloud '; [[ $D_ISO == 1 ]] && printf 'iso '; [[ -n $D_DOCKER ]] && printf 'docker'; } )" "$C_RESET"
         done
         printf '  %s[ c]%s Custom ISO (VM) / custom image (Docker)\n' "$C_BOLD" "$C_RESET"
-        OS_CHOICE="$(prompt "Select OS (1-12 or c)" "1")"
+        OS_CHOICE="$(prompt "Select OS (1-${DISTRO_COUNT}, c, or an id like debian-stable)" "1")"
     fi
-    distro_load "$OS_CHOICE" || die "Invalid OS choice: '$OS_CHOICE'"
+    distro_load "$OS_CHOICE" || die "Invalid OS choice: '$OS_CHOICE' (use 1-${DISTRO_COUNT}, c, or an id - see --list)."
+    if [[ -n "$D_DYN" ]]; then
+        info "Looking up the newest '$D_ID' release..."
+        resolve_release || die "Could not read the release metadata for '$D_ID' (check internet/DNS), or pick a fixed entry such as 1-4."
+    fi
     if [[ $DO_VM == 0 && -z "$D_DOCKER" && "$D_KEY" != custom ]]; then
         die "$D_NAME has no Docker image (it needs a full VM). Choose another distro or deploy as a VM."
     fi
@@ -683,77 +821,280 @@ choose_distro() {
     _log INPUT "OS_CHOICE=$OS_CHOICE ($D_KEY)"
 }
 
-# resolve_cloud_url -> CLOUD_URL (+ CLOUD_FILE)
-resolve_cloud_url() {
-    local f
-    CLOUD_URL="$CLOUD_IMAGE_URL"
-    if [[ -z "$CLOUD_URL" ]]; then
-        info "Resolving the latest $D_NAME cloud image..."
-        case "$D_KEY" in
-            ubuntu2404) CLOUD_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img" ;;
-            ubuntu2604) CLOUD_URL="https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img" ;;
-            debian12)   CLOUD_URL="https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2" ;;
-            debian13)   CLOUD_URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2" ;;
-            fedora)
-                resolve_fedora_version
-                f="$(latest_match "https://dl.fedoraproject.org/pub/fedora/linux/releases/${FEDORA_VERSION}/Cloud/x86_64/images/" \
-                    "Fedora-Cloud-Base-Generic-${FEDORA_VERSION}-[0-9.]+\.x86_64\.qcow2")"
-                [[ -n "$f" ]] && CLOUD_URL="https://dl.fedoraproject.org/pub/fedora/linux/releases/${FEDORA_VERSION}/Cloud/x86_64/images/$f" ;;
-            arch|omarchy) CLOUD_URL="https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2" ;;
-            rocky9)     CLOUD_URL="https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2" ;;
-            rocky10)    CLOUD_URL="https://dl.rockylinux.org/pub/rocky/10/images/x86_64/Rocky-10-GenericCloud-Base.latest.x86_64.qcow2" ;;
-            centos10)   CLOUD_URL="https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2" ;;
-            alpine)
-                f="$(latest_match "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/cloud/" \
-                    'generic_alpine-[0-9.]+-x86_64-bios-cloudinit-r0\.qcow2')"
-                [[ -n "$f" ]] && CLOUD_URL="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/cloud/${f}" ;;
-        esac
-    fi
-    [[ -n "$CLOUD_URL" ]] || die "Could not determine a cloud image URL for $D_NAME (set CLOUD_IMAGE_URL=...)."
-    CLOUD_FILE="$(basename "${CLOUD_URL%%\?*}")"
-    ok "Cloud image: $CLOUD_URL"
+# ---------------------------------------------------------------------------
+# Cloud image resolvers -> CLOUD_URL, CLOUD_FILE (versioned cache name),
+# CLOUD_SUM_URL (checksum file), CLOUD_LABEL. Return 1 if nothing is found.
+# ---------------------------------------------------------------------------
+# fedora_candidates - release numbers to try, newest first (FEDORA_VERSION pins one)
+fedora_candidates() {
+    if [[ -n "$FEDORA_VERSION" ]]; then echo "$FEDORA_VERSION"; return 0; fi
+    hrefs "https://dl.fedoraproject.org/pub/fedora/linux/releases/" '[0-9]+/' | sort -rn | sed -n '1,4p'
 }
 
-resolve_fedora_version() {
-    if [[ -z "$FEDORA_VERSION" ]]; then
-        FEDORA_VERSION="$(fetch_text "https://dl.fedoraproject.org/pub/fedora/linux/releases/" \
-            | grep -oE 'href="[0-9]+/' | grep -oE '[0-9]+' | sort -n | tail -n1 || true)"
-        FEDORA_VERSION="${FEDORA_VERSION:-44}"
-    fi
-}
-
-# resolve_iso_url -> ISO_URL
-resolve_iso_url() {
-    local f base
-    [[ -n "$ISO_URL" ]] && { ok "Installer ISO: $ISO_URL"; return 0; }
-    info "Resolving the latest $D_NAME installer ISO..."
-    case "$D_KEY" in
-        ubuntu2404|ubuntu2604)
-            local v="24.04"; [[ "$D_KEY" == ubuntu2604 ]] && v="26.04"
-            f="$(latest_match "https://releases.ubuntu.com/${v}/" "ubuntu-${v//./\\.}(\.[0-9]+)?-live-server-amd64\.iso")"
-            [[ -n "$f" ]] && ISO_URL="https://releases.ubuntu.com/${v}/$f" ;;
-        debian12|debian13)
-            base="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/"
-            [[ "$D_KEY" == debian12 ]] && base="https://cdimage.debian.org/cdimage/archive/latest-oldstable/amd64/iso-cd/"
-            f="$(latest_match "$base" "debian-${D_KEY#debian}\.[0-9.]+-amd64-netinst\.iso")"
-            [[ -n "$f" ]] && ISO_URL="${base}$f" ;;
-        fedora)
-            resolve_fedora_version
-            base="https://dl.fedoraproject.org/pub/fedora/linux/releases/${FEDORA_VERSION}/Server/x86_64/iso/"
-            f="$(latest_match "$base" "Fedora-Server-netinst-x86_64-${FEDORA_VERSION}-[0-9.]+\.iso")"
-            [[ -n "$f" ]] && ISO_URL="${base}$f" ;;
-        arch)     ISO_URL="https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso" ;;
-        nixos)    ISO_URL="https://channels.nixos.org/nixos-unstable/latest-nixos-minimal-x86_64-linux.iso" ;;
-        rocky9)   ISO_URL="https://dl.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso" ;;
-        rocky10)  ISO_URL="https://dl.rockylinux.org/pub/rocky/10/isos/x86_64/Rocky-10-latest-x86_64-minimal.iso" ;;
-        centos10) ISO_URL="https://mirror.stream.centos.org/10-stream/BaseOS/x86_64/iso/CentOS-Stream-10-latest-x86_64-boot.iso" ;;
-        alpine)
-            base="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/"
-            f="$(latest_match "$base" 'alpine-virt-[0-9.]+-x86_64\.iso')"
-            [[ -n "$f" ]] && ISO_URL="${base}$f" ;;
+find_cloud_image() {
+    local dir file serial n build ver
+    CLOUD_URL=""; CLOUD_FILE=""; CLOUD_SUM_URL=""; CLOUD_LABEL=""
+    case "$D_FAMILY:$D_KEY" in
+        ubuntu:*)
+            # Dated build directories under /<codename>/ - newest that has the image.
+            dir="https://cloud-images.ubuntu.com/${D_CODENAME}/"
+            while read -r serial; do
+                [[ -z "$serial" ]] && continue
+                CLOUD_URL="${dir}${serial}/${D_CODENAME}-server-cloudimg-amd64.img"
+                url_ok "$CLOUD_URL" || { CLOUD_URL=""; continue; }
+                CLOUD_SUM_URL="${dir}${serial}/SHA256SUMS"
+                CLOUD_FILE="ubuntu-${D_VER}-${D_CODENAME}-${serial}.qcow2"
+                CLOUD_LABEL="Ubuntu ${D_VER} (${D_CODENAME^}, build ${serial})"
+                break
+            done < <(hrefs "$dir" '[0-9]{8}(\.[0-9]+)?/' | sort -uV | tac | sed -n '1,3p')
+            ;;
+        debian:*)
+            dir="https://cloud.debian.org/images/cloud/${D_CODENAME}/"
+            while read -r serial; do
+                [[ -z "$serial" ]] && continue
+                file="$(fetch_text "${dir}${serial}/" | grep -oE "debian-${D_VER}-generic-amd64-${serial}\.qcow2" | head -n1 || true)"
+                [[ -z "$file" ]] && continue
+                CLOUD_URL="${dir}${serial}/${file}"
+                CLOUD_SUM_URL="${dir}${serial}/SHA512SUMS"
+                CLOUD_FILE="debian-${D_VER}-${D_CODENAME}-${serial}.qcow2"
+                CLOUD_LABEL="Debian ${D_VER} (${D_CODENAME^}, build ${serial})"
+                break
+            done < <(hrefs "$dir" '[0-9]{8}-[0-9]+/' | sort -uV | tac | sed -n '1,5p')
+            ;;
+        *:fedora)
+            # Not every release dir has a Cloud image yet (e.g. while it is being
+            # composed), so walk down from the newest until one does.
+            while read -r n; do
+                [[ -z "$n" ]] && continue
+                dir="https://dl.fedoraproject.org/pub/fedora/linux/releases/${n}/Cloud/x86_64/images/"
+                file="$(latest_match "$dir" "Fedora-Cloud-Base-Generic-${n}-[0-9.]+\.x86_64\.qcow2")"
+                [[ -z "$file" ]] && continue
+                build="${file#Fedora-Cloud-Base-Generic-"${n}"-}"; build="${build%.x86_64.qcow2}"
+                CLOUD_URL="https://download.fedoraproject.org/pub/fedora/linux/releases/${n}/Cloud/x86_64/images/${file}"
+                url_ok "$CLOUD_URL" || CLOUD_URL="${dir}${file}"
+                CLOUD_SUM_URL="${dir}Fedora-Cloud-${n}-${build}-x86_64-CHECKSUM"
+                CLOUD_FILE="fedora-${n}-${build}.qcow2"
+                CLOUD_LABEL="Fedora ${n} Cloud (build ${build})"
+                FEDORA_VERSION="$n"
+                break
+            done < <(fedora_candidates)
+            ;;
+        *:arch|*:omarchy)
+            dir="https://geo.mirror.pkgbuild.com/images/latest/"
+            file="$(latest_match "$dir" 'Arch-Linux-x86_64-cloudimg-[0-9.]+\.qcow2')"
+            if [[ -n "$file" ]]; then
+                ver="${file#Arch-Linux-x86_64-cloudimg-}"; ver="${ver%.qcow2}"
+                CLOUD_URL="${dir}${file}"; CLOUD_SUM_URL="${CLOUD_URL}.SHA256"
+                CLOUD_FILE="arch-${ver}.qcow2"; CLOUD_LABEL="Arch Linux (build ${ver})"
+            fi
+            ;;
+        *:rocky9|*:rocky10)
+            n="${D_KEY#rocky}"
+            dir="https://dl.rockylinux.org/pub/rocky/${n}/images/x86_64/"
+            file="$(latest_match "$dir" "Rocky-${n}-GenericCloud(-Base)?-${n}\.[0-9]+-[0-9.]+\.x86_64\.qcow2")"
+            if [[ -n "$file" ]]; then
+                ver="$(sed -E "s/^Rocky-${n}-GenericCloud(-Base)?-//; s/\.x86_64\.qcow2$//" <<<"$file")"
+                CLOUD_URL="${dir}${file}"; CLOUD_SUM_URL="${CLOUD_URL}.CHECKSUM"
+                CLOUD_FILE="rocky-${ver}.qcow2"; CLOUD_LABEL="Rocky Linux ${ver%%-*} (build ${ver#*-})"
+            fi
+            ;;
+        *:centos10)
+            dir="https://cloud.centos.org/centos/10-stream/x86_64/images/"
+            file="$(latest_match "$dir" 'CentOS-Stream-GenericCloud-10-[0-9]{8}\.[0-9]+\.x86_64\.qcow2')"
+            if [[ -n "$file" ]]; then
+                ver="${file#CentOS-Stream-GenericCloud-10-}"; ver="${ver%.x86_64.qcow2}"
+                CLOUD_URL="${dir}${file}"; CLOUD_SUM_URL="${CLOUD_URL}.SHA256SUM"
+                CLOUD_FILE="$file"; CLOUD_LABEL="CentOS Stream 10 (build ${ver})"
+            fi
+            ;;
+        *:alpine)
+            # Any rebuild number (-r0, -r1, ...), not just -r0.
+            dir="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/cloud/"
+            file="$(latest_match "$dir" 'generic_alpine-[0-9.]+-x86_64-bios-cloudinit-r[0-9]+\.qcow2')"
+            if [[ -n "$file" ]]; then
+                ver="$(sed -E 's/^generic_alpine-([0-9.]+)-x86_64-bios-cloudinit-(r[0-9]+)\.qcow2$/\1-\2/' <<<"$file")"
+                CLOUD_URL="${dir}${file}"; CLOUD_SUM_URL="${CLOUD_URL}.sha512"
+                CLOUD_FILE="$file"; CLOUD_LABEL="Alpine Linux ${ver%-r*} (${ver##*-})"
+            fi
+            ;;
     esac
-    [[ -n "$ISO_URL" ]] || die "Could not determine an installer ISO URL for $D_NAME (set ISO_URL=... or use a custom ISO)."
-    ok "Installer ISO: $ISO_URL"
+    [[ -n "$CLOUD_URL" && -n "$CLOUD_FILE" ]]
+}
+
+# resolve_cloud_url - CLOUD_IMAGE_URL override, or the newest image (dies if none)
+resolve_cloud_url() {
+    if [[ -n "$CLOUD_IMAGE_URL" ]]; then
+        CLOUD_URL="$CLOUD_IMAGE_URL"; CLOUD_FILE="$(basename "${CLOUD_URL%%\?*}")"
+        CLOUD_SUM_URL="$CLOUD_IMAGE_SUM_URL"; CLOUD_LABEL="custom image (CLOUD_IMAGE_URL)"
+    else
+        info "Looking up the newest $D_NAME cloud image..."
+        find_cloud_image || die "Could not find the newest $D_NAME cloud image on its official mirror. Check internet/DNS, try again later, or set CLOUD_IMAGE_URL=..."
+    fi
+    ok "Cloud image: $CLOUD_LABEL"
+    info "    $CLOUD_URL"
+}
+
+# ---------------------------------------------------------------------------
+# Installer ISO resolvers -> ISO_URL, ISO_FILE (versioned local name),
+# ISO_SUM_URL, ISO_LABEL. Return 1 if nothing is found.
+# ---------------------------------------------------------------------------
+find_iso() {
+    local base file n build v eff date
+    ISO_URL=""; ISO_FILE=""; ISO_SUM_URL=""; ISO_LABEL=""
+    case "$D_FAMILY:$D_KEY" in
+        ubuntu:*)
+            base="https://releases.ubuntu.com/${D_VER}/"
+            file="$(latest_match "$base" "ubuntu-${D_VER//./\\.}(\.[0-9]+)?-live-server-amd64\.iso")"
+            [[ -n "$file" ]] && { ISO_URL="${base}${file}"; ISO_SUM_URL="${base}SHA256SUMS"; }
+            ;;
+        debian:*)
+            # The current release lives in debian-cd/current, older ones in the archive.
+            base="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/"
+            file="$(latest_match "$base" "debian-${D_VER}\.[0-9.]+-amd64-netinst\.iso")"
+            if [[ -z "$file" ]]; then
+                v="$(hrefs "https://cdimage.debian.org/cdimage/archive/" "${D_VER}\.[0-9.]+/" | sort -uV | tail -n1)"
+                if [[ -n "$v" ]]; then
+                    base="https://cdimage.debian.org/cdimage/archive/${v}/amd64/iso-cd/"
+                    file="$(latest_match "$base" "debian-${D_VER}\.[0-9.]+-amd64-netinst\.iso")"
+                fi
+            fi
+            [[ -n "$file" ]] && { ISO_URL="${base}${file}"; ISO_SUM_URL="${base}SHA512SUMS"; }
+            ;;
+        *:fedora)
+            while read -r n; do
+                [[ -z "$n" ]] && continue
+                base="https://dl.fedoraproject.org/pub/fedora/linux/releases/${n}/Server/x86_64/iso/"
+                file="$(latest_match "$base" "Fedora-Server-netinst-x86_64-${n}-[0-9.]+\.iso")"
+                [[ -z "$file" ]] && continue
+                build="${file#Fedora-Server-netinst-x86_64-"${n}"-}"; build="${build%.iso}"
+                ISO_URL="${base}${file}"; ISO_SUM_URL="${base}Fedora-Server-${n}-${build}-x86_64-CHECKSUM"
+                FEDORA_VERSION="$n"
+                break
+            done < <(fedora_candidates)
+            ;;
+        *:arch)
+            base="https://geo.mirror.pkgbuild.com/iso/latest/"
+            file="$(latest_match "$base" 'archlinux-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-x86_64\.iso')"
+            [[ -n "$file" ]] && { ISO_URL="${base}${file}"; ISO_SUM_URL="${base}sha256sums.txt"; }
+            ;;
+        *:nixos)
+            # The channel alias redirects to the versioned build on releases.nixos.org.
+            base="https://channels.nixos.org/nixos-unstable/latest-nixos-minimal-x86_64-linux.iso"
+            eff="$(effective_url "$base")"
+            if [[ "$eff" == *.iso && "$eff" != "$base" ]]; then
+                ISO_URL="$eff"; ISO_SUM_URL="${eff}.sha256"
+            elif url_ok "$base"; then
+                date="$(last_modified "$base")"
+                ISO_URL="$base"; ISO_SUM_URL="${base}.sha256"
+                ISO_FILE="nixos-minimal-unstable-${date:-$TIMESTAMP}-x86_64-linux.iso"
+            fi
+            ;;
+        *:rocky9|*:rocky10)
+            n="${D_KEY#rocky}"
+            base="https://dl.rockylinux.org/pub/rocky/${n}/isos/x86_64/"
+            file="$(latest_match "$base" "Rocky-${n}\.[0-9]+-x86_64-minimal\.iso")"
+            [[ -n "$file" ]] && { ISO_URL="${base}${file}"; ISO_SUM_URL="${base}CHECKSUM"; }
+            ;;
+        *:centos10)
+            # CentOS publishes only a 'latest' alias; name the local copy after its
+            # publish date so a newer build is downloaded instead of reusing an old one.
+            base="https://mirror.stream.centos.org/10-stream/BaseOS/x86_64/iso/CentOS-Stream-10-latest-x86_64-boot.iso"
+            if url_ok "$base"; then
+                date="$(last_modified "$base")"
+                ISO_URL="$base"; ISO_SUM_URL="${base}.SHA256SUM"
+                ISO_FILE="CentOS-Stream-10-${date:-$TIMESTAMP}-x86_64-boot.iso"
+            fi
+            ;;
+        *:alpine)
+            base="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/"
+            file="$(latest_match "$base" 'alpine-virt-[0-9.]+-x86_64\.iso')"
+            [[ -n "$file" ]] && { ISO_URL="${base}${file}"; ISO_SUM_URL="${ISO_URL}.sha256"; }
+            ;;
+    esac
+    [[ -n "$ISO_URL" ]] || return 1
+    ISO_FILE="${ISO_FILE:-$(basename "${ISO_URL%%\?*}")}"
+    ISO_LABEL="${ISO_FILE}"
+}
+
+# resolve_iso_url - ISO_URL override, or the newest installer ISO (dies if none)
+resolve_iso_url() {
+    if [[ -n "$ISO_URL" && -z "${ISO_FILE:-}" ]]; then
+        ISO_FILE="$(basename "${ISO_URL%%\?*}")"
+    elif [[ -z "$ISO_URL" ]]; then
+        info "Looking up the newest $D_NAME installer ISO..."
+        find_iso || die "Could not find the newest $D_NAME installer ISO on its official mirror. Check internet/DNS, try again later, or set ISO_URL=... / use a custom ISO."
+    fi
+    ok "Installer ISO: $ISO_FILE"
+    info "    $ISO_URL"
+}
+
+# ---------------------------------------------------------------------------
+# Checksum verification
+# ---------------------------------------------------------------------------
+# expected_hash SUMS NAME - hash for NAME from a checksum file in any common
+# format: GNU ("hash  name" / "hash *name"), BSD ("SHA256 (name) = hash") or
+# a bare hash.
+expected_hash() {
+    local sums="$1" name="$2" h
+    h="$(awk -v n="$name" '{
+            ok = 0
+            for (i = 1; i <= NF; i++) { t = $i; gsub(/^[*(]|[)]$/, "", t); if (t == n) ok = 1 }
+            if (ok) for (i = 1; i <= NF; i++)
+                if ($i ~ /^[0-9a-fA-F]+$/ && (length($i) == 64 || length($i) == 128)) { print tolower($i); exit }
+        }' <<<"$sums")"
+    if [[ -z "$h" ]]; then
+        local bare
+        bare="$(tr -d '[:space:]' <<<"$sums")"
+        if [[ $(wc -w <<<"$sums") -eq 1 && "$bare" =~ ^[0-9a-fA-F]{64}([0-9a-fA-F]{64})?$ ]]; then h="${bare,,}"; fi
+    fi
+    printf '%s' "$h"
+}
+
+# verify_file FILE URL SUM_URL - 0 = verified or nothing to verify against
+# (reported), 1 = real mismatch.
+verify_file() {
+    local file="$1" url="$2" sum_url="$3" name sums expected actual algo
+    if [[ -z "$sum_url" ]]; then warn "No checksum published for $(basename "$file") - not verified."; return 0; fi
+    name="$(basename "${url%%\?*}")"
+    sums="$(fetch_text "$sum_url")"
+    if [[ -z "$sums" ]]; then warn "Could not fetch $sum_url - download not verified."; return 0; fi
+    expected="$(expected_hash "$sums" "$name")"
+    if [[ -z "$expected" ]]; then warn "$name is not listed in $sum_url - download not verified."; return 0; fi
+    if [[ ${#expected} -eq 128 ]]; then algo=512; actual="$(sha512sum "$file" | cut -d' ' -f1)"
+    else algo=256; actual="$(sha256sum "$file" | cut -d' ' -f1)"; fi
+    _log VERIFY "$name sha$algo expected=$expected actual=$actual"
+    if [[ "$actual" != "$expected" ]]; then
+        err "CHECKSUM MISMATCH for $name"
+        err "    expected $expected"
+        err "    got      $actual"
+        return 1
+    fi
+    ok "SHA${algo} checksum verified: $name"
+}
+
+# ---------------------------------------------------------------------------
+# --list: what every menu entry resolves to right now
+# ---------------------------------------------------------------------------
+list_sources() {
+    local i rc=0
+    for i in $(seq 1 "$DISTRO_COUNT"); do
+        distro_load "$i"
+        if ! resolve_release; then
+            printf '  %s[%2d] %-16s%s %s[!] could not read the release metadata%s\n' "$C_BOLD" "$i" "$D_ID" "$C_RESET" "$C_YELLOW" "$C_RESET"
+            rc=1; continue
+        fi
+        printf '  %s[%2d] %-16s%s %s\n' "$C_BOLD" "$i" "$D_ID" "$C_RESET" "$D_NAME"
+        if [[ $D_CLOUD == 1 ]]; then
+            if find_cloud_image; then printf '       cloud : %s\n               %s%s%s\n' "$CLOUD_LABEL" "$C_DIM" "$CLOUD_URL" "$C_RESET"
+            else printf '       cloud : %s[!] not found (mirror/network issue?)%s\n' "$C_YELLOW" "$C_RESET"; rc=1; fi
+        fi
+        if [[ $D_ISO == 1 ]]; then
+            if find_iso; then printf '       iso   : %s\n               %s%s%s\n' "$ISO_LABEL" "$C_DIM" "$ISO_URL" "$C_RESET"
+            else printf '       iso   : %s[!] not found (mirror/network issue?)%s\n' "$C_YELLOW" "$C_RESET"; rc=1; fi
+        fi
+        [[ -n "$D_DOCKER" ]] && printf '       docker: %s\n' "$D_DOCKER"
+    done
+    return "$rc"
 }
 
 # =============================================================================
@@ -800,7 +1141,7 @@ prepare_defaults() {
         (( VM_CPUS > CPU_TOTAL )) && VM_CPUS="$CPU_TOTAL"
         if [[ "$VM_MODE" == cloud && $D_CLOUD_BIOS_ONLY == 1 ]]; then VM_BIOS=seabios; fi
         if [[ -z "$VM_ISO_FILE" && "$VM_MODE" == iso && -n "$ISO_URL" ]]; then
-            VM_ISO_FILE="${ISO_PATH}/$(basename "${ISO_URL%%\?*}")"
+            VM_ISO_FILE="${ISO_PATH%/}/${ISO_FILE}"
         fi
     fi
     if [[ $DO_DOCKER == 1 ]]; then
@@ -986,9 +1327,36 @@ ensure_dir() {
 # =============================================================================
 # 7. Downloads
 # =============================================================================
+# download URL DEST [SUM_URL] - fetch URL to DEST and verify it against the
+# published checksum. A cached DEST is re-verified; if it no longer matches it
+# is downloaded again. A mismatch after a fresh download is fatal.
 download() {
+    local url="$1" dest="$2" sum_url="${3:-}"
+    is_yes "$VERIFY_CHECKSUMS" || sum_url=""
+    if [[ -f "$dest" ]]; then
+        if [[ "$DRY_RUN" == 1 || -z "$sum_url" ]]; then ok "Using existing file: $dest"; return 0; fi
+        info "Found cached $(basename "$dest") - re-checking its checksum..."
+        if verify_file "$dest" "$url" "$sum_url"; then ok "Using existing file: $dest"; return 0; fi
+        warn "Cached file does not match the published checksum - downloading it again."
+        rm -f "$dest"
+    fi
+    fetch_file "$url" "$dest"
+    if [[ "$DRY_RUN" == 1 ]]; then
+        [[ -n "$sum_url" ]] && info "Would verify against $sum_url"
+        return 0
+    fi
+    if [[ -z "$sum_url" ]] && ! is_yes "$VERIFY_CHECKSUMS"; then
+        warn "Checksum verification disabled (VERIFY_CHECKSUMS=no)."
+    elif ! verify_file "$dest" "$url" "$sum_url"; then
+        rm -f "$dest"
+        die "Downloaded file failed checksum verification and was deleted: $url (re-run to try again)."
+    fi
+    add_created "Download: $dest ($(du -h "$dest" | cut -f1))"
+}
+
+# fetch_file URL DEST - raw transfer via a *.part file
+fetch_file() {
     local url="$1" dest="$2"
-    if [[ -f "$dest" ]]; then ok "Using existing file: $dest"; return 0; fi
     info "Downloading $url"
     info "        -> $dest"
     [[ "$DRY_RUN" == 1 ]] && { run_q "$DOWNLOADER" "$url"; return 0; }
@@ -1005,7 +1373,6 @@ download() {
         die "Download failed (exit $rc): $url"
     fi
     mv "${dest}.part" "$dest"
-    add_created "Download: $dest ($(du -h "$dest" | cut -f1))"
 }
 
 # =============================================================================
@@ -1269,18 +1636,19 @@ deploy_vm() {
 
     if [[ "$VM_MODE" == cloud ]]; then
         ensure_dir "$CLOUD_CACHE" "Cloud image cache"
-        download "$CLOUD_URL" "${CLOUD_CACHE}/${CLOUD_FILE}"
+        download "$CLOUD_URL" "${CLOUD_CACHE}/${CLOUD_FILE}" "$CLOUD_SUM_URL"
     else
         if [[ "$VM_ISO_FILE" =~ ^(https?|ftp|file):// ]]; then
             ensure_dir "$ISO_PATH" "ISO share"
             VM_ISO_LOCAL="${ISO_PATH%/}/$(basename "${VM_ISO_FILE%%\?*}")"
-            download "$VM_ISO_FILE" "$VM_ISO_LOCAL"
-        elif [[ -f "$VM_ISO_FILE" ]]; then
-            VM_ISO_LOCAL="$VM_ISO_FILE"; ok "Using existing ISO: $VM_ISO_LOCAL"
-        elif [[ -n "$ISO_URL" ]]; then
+            download "$VM_ISO_FILE" "$VM_ISO_LOCAL" "$ISO_SUM_URL"
+        elif [[ -n "$ISO_URL" && "$(basename "$VM_ISO_FILE")" == "$ISO_FILE" ]]; then
+            # The looked-up ISO (cached copies are re-verified by download).
             ensure_dir "$(dirname "$VM_ISO_FILE")" "ISO folder"
             VM_ISO_LOCAL="$VM_ISO_FILE"
-            download "$ISO_URL" "$VM_ISO_LOCAL"
+            download "$ISO_URL" "$VM_ISO_LOCAL" "$ISO_SUM_URL"
+        elif [[ -f "$VM_ISO_FILE" ]]; then
+            VM_ISO_LOCAL="$VM_ISO_FILE"; ok "Using existing ISO: $VM_ISO_LOCAL"
         else
             die "ISO file not found: $VM_ISO_FILE"
         fi
@@ -1478,6 +1846,12 @@ deploy_docker() {
 # Main
 # =============================================================================
 main() {
+    if [[ "$LIST_ONLY" == 1 ]]; then
+        printf '%sUnraid Quick Deploy v%s - what each menu entry resolves to right now%s\n\n' "$C_BOLD" "$QD_VERSION" "$C_RESET"
+        detect_downloader >/dev/null
+        list_sources || { warn "Some entries could not be resolved (see [!] above)."; exit 1; }
+        exit 0
+    fi
     banner
     _log START "unraid-quick-deploy v${QD_VERSION} dry_run=${DRY_RUN} assume_yes=${ASSUME_YES} user=$(id -un 2>/dev/null || echo "?")"
     detect_environment

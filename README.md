@@ -214,9 +214,21 @@ Deploys the same distro as a VM **and** as a container, each with its own settin
 | 10 | Alpine Linux (latest stable) | ✅ BIOS cloud-init | ✅ virt | `alpine:latest` |
 | 11 | CentOS Stream 10 | ✅ GenericCloud | ✅ boot | `quay.io/centos/centos:stream10` |
 | 12 | Rocky Linux 10 | ✅ GenericCloud-Base | ✅ minimal | `rockylinux/rockylinux:10` |
+| 13 | Ubuntu LTS (newest, looked up live) | ✅ | ✅ live-server | `ubuntu:<version>` |
+| 14 | Ubuntu newest release (incl. interim) | ✅ | ✅ live-server | `ubuntu:<version>` |
+| 15 | Debian stable (looked up live) | ✅ | ✅ netinst | `debian:<version>` |
+| 16 | Debian oldstable (looked up live) | ✅ | ✅ netinst | `debian:<version>` |
 | c | **Custom** | – | ✅ any local ISO path or URL | any image you enter |
 
-Versioned filenames (Ubuntu point releases, Debian, Fedora, Alpine) are looked up from the official mirror index pages at run time, so new releases are picked up automatically. You can override any URL with `CLOUD_IMAGE_URL` or `ISO_URL`.
+**Nothing is pinned.** Each time the script runs, it reads the distro's own release metadata or mirror listing and picks the newest dated or versioned build. It never uses a moving `latest` alias, so a newer release is downloaded fresh instead of reusing an old cached copy. Entries 13–16 also look up *which release* is current (from Canonical's `meta-release` and Debian's `stable`/`oldstable` suites), so they move to a new LTS or stable release on their own. Menu numbers never change meaning. New entries are added at the end, and every entry also has a stable id (e.g. `OS_CHOICE=debian-stable`).
+
+To see what each entry points to right now, run this. It needs no root and changes nothing:
+
+```bash
+./unraid-quick-deploy.sh --list
+```
+
+**Checksums.** Every looked-up image and ISO is checked against the SHA-256/SHA-512 file its mirror publishes. A cached copy is re-checked before reuse and downloaded again if it no longer matches. A mismatch after a fresh download deletes the file and stops the script. For your own `CLOUD_IMAGE_URL` / `ISO_URL`, point `CLOUD_IMAGE_SUM_URL` / `ISO_SUM_URL` at a checksum file; otherwise the download is reported as *not verified*.
 
 **Omarchy:** cloud-init puts `~/install-omarchy.sh` in your home directory and adds a login reminder. After the first boot, log in and run `./install-omarchy.sh`.
 
@@ -248,7 +260,7 @@ Every setting can be **preset from the environment**. Presets become the default
 | Variable | Default | Description |
 |---|---|---|
 | `DEPLOY_TYPE` | *(prompt)* | `vm` / `docker` / `both` (or `1` / `2` / `3`). |
-| `OS_CHOICE` | *(prompt)* | `1`–`12` or `c` (custom). |
+| `OS_CHOICE` | *(prompt)* | `1`–`16`, `c` (custom), or an id such as `ubuntu-lts` / `debian-stable` (see `--list`). |
 | `ASSUME_YES` | `0` | `1` is the same as `--yes`. |
 | `DRY_RUN` | `0` | `1` is the same as `--dry-run`. |
 | `LOG_DIR` | `/tmp` | Where `unraid-quick-deploy-<timestamp>.log` is written. |
@@ -288,6 +300,9 @@ Every setting can be **preset from the environment**. Presets become the default
 | `DEFAULT_PASS` | `password123` | Password for the user **and root**. **Change it.** |
 | `CLOUD_IMAGE_URL` | *(per distro)* | Override the cloud image URL. |
 | `ISO_URL` | *(per distro)* | Override the installer ISO URL. |
+| `CLOUD_IMAGE_SUM_URL` | *(empty)* | Checksum file for a `CLOUD_IMAGE_URL` override. |
+| `ISO_SUM_URL` | *(empty)* | Checksum file for an `ISO_URL` override. |
+| `VERIFY_CHECKSUMS` | `yes` | `no` skips checksum verification (not recommended). |
 | `FEDORA_VERSION` | newest | Pin a Fedora release, e.g. `43`. |
 | `NVRAM_DIR` | `/etc/libvirt/qemu/nvram` | Where OVMF vars files go. |
 
@@ -337,7 +352,7 @@ The VM definition itself is stored by libvirt, inside Unraid's `libvirt.img`, th
 - **Service checks.** It makes sure the VM Manager / Docker service is enabled in Unraid's config and that the Docker socket exists.
 - **Paths.** Target directories must exist or be creatable, and must be **writable**. This is tested with a real write. Creating a new top-level folder under `/mnt/user` makes a new share, and the script warns you about that first.
 - **No overwrites.** VM and container names must be unused, and an existing vDisk is never overwritten.
-- **Safe downloads.** Files download to `*.part` and are renamed only after they complete. Existing ISOs and cloud images are reused.
+- **Safe downloads.** Files download to `*.part` and are renamed only after they complete. Every looked-up download is checked against its mirror's published SHA-256/SHA-512 checksum. Cached ISOs and cloud images are re-checked before they are reused.
 - **Post-checks.** After `virsh define`, the VM must show up in `virsh dominfo`. After `virsh start`, it must be `running`. After `docker run`, the container must be `running`.
 - **Errors.** Any failure stops the script with a clear message, a list of what was already created, and the log path.
 
@@ -391,7 +406,13 @@ Edit the VM in the VMS tab, clear the *OS Install ISO* field, and save. Or run `
 <details>
 <summary><b>A download fails (404)</b></summary>
 
-Mirrors sometimes rename files. Rerun with `CLOUD_IMAGE_URL=...` or `ISO_URL=...`, and please open a PR with the new URL. Partial downloads are kept as `*.part` and never reused.
+Run `./unraid-quick-deploy.sh --list` to see which entries currently resolve. Mirrors sometimes change their layout. Rerun with `CLOUD_IMAGE_URL=...` or `ISO_URL=...` (plus `*_SUM_URL` for verification), and please open an issue or PR. Partial downloads are kept as `*.part` and never reused.
+</details>
+
+<details>
+<summary><b>CHECKSUM MISMATCH</b></summary>
+
+The file did not match the hash its mirror publishes, usually because of a corrupted transfer or a mirror that is mid-sync. The bad file has already been deleted. Rerun the script to download it again.
 </details>
 
 <details>
@@ -418,6 +439,7 @@ rm -f /boot/config/plugins/dockerMan/templates-user/my-<container>.xml
 sudo tests/mock-unraid.sh                                        # interactive
 sudo DEPLOY_TYPE=both OS_CHOICE=1 tests/mock-unraid.sh --yes     # unattended
 sudo MOCK_VIRSH_BROKEN=1 DEPLOY_TYPE=vm tests/mock-unraid.sh -y  # failure path
+sudo MOCK_BAD_CHECKSUM=1 DEPLOY_TYPE=vm OS_CHOICE=1 VM_MODE=cloud tests/mock-unraid.sh -y  # checksum mismatch path
 ls /tmp/unraid-mock/state                                        # recorded virsh/docker calls + defined XML
 ```
 

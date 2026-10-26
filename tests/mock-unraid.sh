@@ -13,6 +13,7 @@
 #   sudo tests/mock-unraid.sh [script options]          # interactive
 #   sudo DEPLOY_TYPE=both OS_CHOICE=1 tests/mock-unraid.sh --yes
 #   sudo MOCK_VIRSH_BROKEN=1 DEPLOY_TYPE=vm tests/mock-unraid.sh --yes   # exercise failure path
+#   sudo MOCK_BAD_CHECKSUM=1 DEPLOY_TYPE=vm OS_CHOICE=1 VM_MODE=cloud tests/mock-unraid.sh --yes  # checksum mismatch
 #
 # Afterwards inspect $MOCK_ROOT/state/ (virsh/docker call logs, defined XML).
 set -euo pipefail
@@ -47,6 +48,13 @@ SOCK="$MOCK_ROOT/var/run/docker.sock"
 # A tiny fake "cloud image" served via file://
 [[ -f "$MOCK_ROOT/fake-cloud.qcow2" ]] || qemu-img create -q -f qcow2 "$MOCK_ROOT/fake-cloud.qcow2" 2G
 [[ -f "$MOCK_ROOT/mnt/user/isos/custom.iso" ]] || head -c 1048576 /dev/zero >"$MOCK_ROOT/mnt/user/isos/custom.iso"
+# Its checksum file, so download verification is exercised. MOCK_BAD_CHECKSUM=1
+# publishes a wrong hash to test the mismatch path.
+if [[ "${MOCK_BAD_CHECKSUM:-0}" == 1 ]]; then
+    printf '%064d  fake-cloud.qcow2\n' 0 >"$MOCK_ROOT/SHA256SUMS"
+else
+    (cd "$MOCK_ROOT" && sha256sum fake-cloud.qcow2 >SHA256SUMS)
+fi
 
 cat >"$MOCK_ROOT/bin/virsh" <<'EOF'
 #!/bin/bash
@@ -102,5 +110,8 @@ export UNRAID_VERSION_FILE="$MOCK_ROOT/etc/unraid-version"
 export NVRAM_DIR="$MOCK_ROOT/nvram"
 export DOCKER_SOCK="$SOCK"
 export CLOUD_IMAGE_URL="${CLOUD_IMAGE_URL-file://$MOCK_ROOT/fake-cloud.qcow2}"
+if [[ "$CLOUD_IMAGE_URL" == "file://$MOCK_ROOT/fake-cloud.qcow2" ]]; then
+    export CLOUD_IMAGE_SUM_URL="${CLOUD_IMAGE_SUM_URL-file://$MOCK_ROOT/SHA256SUMS}"
+fi
 export VM_BRIDGE="${VM_BRIDGE:-br0}"
 exec bash "$SCRIPT" "$@"

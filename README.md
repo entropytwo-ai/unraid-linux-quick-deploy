@@ -41,6 +41,8 @@ The script reads your Unraid configuration first. It shows **every detected sett
    - **Docker:** runs `docker pull` and `docker run` with config in `/mnt/user/appdata/<name>`, plus Unraid's PUID/PGID/TZ conventions. It can optionally save a dockerMan user template.
 7. **Logs everything** to `/tmp/unraid-quick-deploy-<timestamp>.log` and finishes with a summary of what was created, IDs, paths, and next steps.
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Prerequisites
 
 | Requirement | Needed for | Notes |
@@ -54,6 +56,8 @@ The script reads your Unraid configuration first. It shows **every detected sett
 | **Free space** | VM | About 0.5–1 GB per cached cloud image or ISO, plus the vDisk (sparse/thin). |
 
 You don't need to install anything extra. The script only uses tools that ship with Unraid (`bash`, `curl`/`wget`, `virsh`, `qemu-img`, `docker`, `openssl`). It checks each one before using it. To build the cloud-init seed it uses `genisoimage`, `mkisofs` or `xorriso` if one is installed. If none of them is there, it builds a small VFAT seed disk with the `dosfstools` tools that ship with Unraid.
+
+<sub>[↑ Back to contents](#table-of-contents)</sub>
 
 ## Quick start
 
@@ -93,6 +97,8 @@ DEFAULT_USER=alice DEFAULT_PASS='S3cure!' bash unraid-quick-deploy.sh --yes
 | `-n`, `--dry-run` | Detect, prompt, and generate XML / cloud-init / template previews, but don't create, download, define, or run anything. |
 | `-h`, `--help` | Show help. |
 | `-V`, `--version` | Show version. |
+
+<sub>[↑ Back to contents](#table-of-contents)</sub>
 
 ## Walkthrough
 
@@ -161,6 +167,8 @@ DEFAULT_USER=alice DEFAULT_PASS='S3cure!' bash unraid-quick-deploy.sh --yes
   Log file: /tmp/unraid-quick-deploy-20261026-170237.log
 ```
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Deployment types
 
 ### `[1]` VM (QEMU/KVM via libvirt)
@@ -198,6 +206,8 @@ The generated XML follows what Unraid's VM Manager writes:
 
 Deploys the same distro as a VM **and** as a container, each with its own settings. If the prerequisites for only one side fail, the script asks whether to continue with the other.
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Supported distributions
 
 | # | Distribution | Cloud image (VM) | Installer ISO (VM) | Docker image |
@@ -232,6 +242,8 @@ To see what each entry points to right now, run this. It needs no root and chang
 
 **Omarchy:** cloud-init puts `~/install-omarchy.sh` in your home directory and adds a login reminder. After the first boot, log in and run `./install-omarchy.sh`.
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Unraid auto-detection
 
 | What | Where it comes from | Fallback |
@@ -250,6 +262,8 @@ To see what each entry points to right now, run this. It needs no root and chang
 | QEMU emulator & machine types | `virsh capabilities` | `/usr/local/sbin/qemu`, `q35` / `pc` |
 | OVMF firmware | `/usr/share/qemu/ovmf-x64/OVMF_CODE-pure-efi.fd` (Unraid) and common distro paths | Falls back to SeaBIOS |
 | Time zone | `timeZone` in `/boot/config/ident.cfg` | `/etc/localtime`, `Etc/UTC` |
+
+<sub>[↑ Back to contents](#table-of-contents)</sub>
 
 ## Configuration reference
 
@@ -323,6 +337,8 @@ Every setting can be **preset from the environment**. Presets become the default
 | `DOCKER_PUID` / `DOCKER_PGID` | `99` / `100` | Unraid `nobody:users`. |
 | `DOCKER_TEMPLATE` | `yes` | Write a dockerMan user template. |
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Where things are stored
 
 ```
@@ -346,6 +362,8 @@ Every setting can be **preset from the environment**. Presets become the default
 
 The VM definition itself is stored by libvirt, inside Unraid's `libvirt.img`, through `virsh define`. That's the same place the VM Manager keeps VMs created in the web UI.
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Validation & safety
 
 - **Tools are actually run, not just located.** Each one has to be on `PATH`, be executable, and pass a real command: `virsh version`, `virsh capabilities`, `qemu-img --version`, `docker --version`, `docker info`, `curl --version` / `wget --version`.
@@ -355,6 +373,8 @@ The VM definition itself is stored by libvirt, inside Unraid's `libvirt.img`, th
 - **Safe downloads.** Files download to `*.part` and are renamed only after they complete. Every looked-up download is checked against its mirror's published SHA-256/SHA-512 checksum. Cached ISOs and cloud images are re-checked before they are reused.
 - **Post-checks.** After `virsh define`, the VM must show up in `virsh dominfo`. After `virsh start`, it must be `running`. After `docker run`, the container must be `running`.
 - **Errors.** Any failure stops the script with a clear message, a list of what was already created, and the log path.
+
+<sub>[↑ Back to contents](#table-of-contents)</sub>
 
 ## Logging & summary
 
@@ -367,6 +387,8 @@ All detections, prompt answers, commands, and command output go to `/tmp/unraid-
 - next steps (find the VM's IP, VNC, `docker exec`, where to manage it in the web UI)
 
 > `/tmp` is in RAM on Unraid. Copy the log to a share if you want to keep it after a reboot.
+
+<sub>[↑ Back to contents](#table-of-contents)</sub>
 
 ## Troubleshooting / FAQ
 
@@ -431,6 +453,8 @@ rm -f /boot/config/plugins/dockerMan/templates-user/my-<container>.xml
 ```
 </details>
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Testing without Unraid
 
 `tests/mock-unraid.sh` creates a fake Unraid server under `/tmp/unraid-mock`: `domain.cfg`, `docker.cfg`, shares, a Docker socket, and stub `virsh`/`docker` commands. It then runs the real script against it. The real `qemu-img` (and `genisoimage`/`xorriso` if installed) is used.
@@ -443,6 +467,8 @@ sudo MOCK_BAD_CHECKSUM=1 DEPLOY_TYPE=vm OS_CHOICE=1 VM_MODE=cloud tests/mock-unr
 ls /tmp/unraid-mock/state                                        # recorded virsh/docker calls + defined XML
 ```
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Security notice
 
 The cloud-image defaults are meant for **homelab convenience**: a well-known password, root SSH login, and password authentication are all on. Before a VM touches anything important:
@@ -451,10 +477,16 @@ The cloud-image defaults are meant for **homelab convenience**: a well-known pas
 - Switch to SSH keys and disable `PasswordAuthentication` and `PermitRootLogin`.
 - Don't port-forward these VMs or containers to the internet.
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## Contributing
 
 PRs are welcome, especially new distros, updated mirror URLs, and Unraid version quirks. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+<sub>[↑ Back to contents](#table-of-contents)</sub>
+
 ## License
 
 MIT
+
+<sub>[↑ Back to contents](#table-of-contents)</sub>
